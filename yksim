@@ -1,0 +1,491 @@
+#!/usr/bin/python3
+"""
+Loosely based on YubiOTP 1.0.0:
+https://pypi.org/project/YubiOTP/
+
+Yubico OTP reference:
+https://docs.yubico.com/yesdk/users-manual/application-otp/yubico-otp.html
+"""
+
+import os
+from struct import pack, unpack
+from secrets import randbelow, token_bytes
+from datetime import datetime, timezone
+import argparse
+from importlib.util import find_spec
+if find_spec('Cryptodome'):
+    # pylint: disable-next=import-error
+    from Cryptodome.Cipher import AES as _AES
+elif find_spec('cryptography'):
+    # pylint: disable-next=import-error
+    from cryptography.hazmat.primitives.ciphers import \
+        Cipher, algorithms as alg, modes
+elif find_spec('pyaes'):
+    # pylint: disable-next=import-error
+    from pyaes import AESModeOfOperationECB  # type: ignore
+else:
+    raise ModuleNotFoundError(
+        'No AES implementations found '
+        '(needs one of: Cryptodome, cryptography, pyaes)')
+
+
+class AES():
+    """ AES-128 ECB operations. """
+    def __init__(self, key: bytes) -> None:
+        if '_AES' in globals():  # Cryptodome
+            self.cypher = _AES.new(key, _AES.MODE_ECB)
+        elif 'Cipher' in globals():  # cryptography
+            self.cypher = Cipher(alg.AES128(key), modes.ECB())  # type: ignore
+        else:  # pyaes
+            self.cypher = AESModeOfOperationECB(key)
+
+    def enc(self, data: bytes) -> bytes:
+        """ Encrypt. """
+        return (self.cypher.encryptor().update(data)  # type: ignore
+                if 'Cipher' in globals() else
+                self.cypher.encrypt(data))
+
+    def dec(self, data: bytes) -> bytes:
+        """ Decrypt. """
+        return (self.cypher.decryptor().update(data)  # type: ignore
+                if 'Cipher' in globals() else
+                self.cypher.decrypt(data))
+
+
+class ModHex():
+    """ Operations with ModHex strings. """
+    HEX_CHARS = '0123456789ABCDEF'
+    MODHEX_CHARS = 'cbdefghijklnrtuv'
+
+    @classmethod
+    def valid(cls, data: str) -> bool:
+        """ Check that a string is a valid ModHex string. """
+        if len(data) % 2 != 0:
+            return False
+        if any(c not in cls.MODHEX_CHARS for c in data.lower()):
+            return False
+        return True
+
+    @classmethod
+    def enc(cls, data: bytes) -> str:
+        """ Encode a byte string as a ModHex string. """
+        hex_to_modhex = str.maketrans(cls.HEX_CHARS, cls.MODHEX_CHARS)
+        return data.hex().upper().translate(hex_to_modhex)
+
+    @classmethod
+    def dec(cls, data: str) -> bytes:
+        """ Decode a ModHex string to a byte string. """
+        if not cls.valid(data):
+            raise ValueError(f'"{data}" is not a valid ModHex string')
+        modhex_to_hex = str.maketrans(cls.MODHEX_CHARS, cls.HEX_CHARS)
+        return bytes.fromhex(data.lower().translate(modhex_to_hex))
+
+
+class CRCError(ValueError):
+    """ Raised when a decrypted token has an invalid checksum. """
+
+
+class YubiKey():
+    """ A simulated YubiKey device. """
+    def __init__(self) -> None:
+        self.public_id = str()
+        self.private_id = bytes()
+        self.aes_key = bytes()
+        self.usage_counter = 0
+        self.timestamp = 0
+        self._poweron = datetime.fromtimestamp(0)
+        self.session_counter = 0
+
+    def __repr__(self) -> str:
+        return f'YubiKey(public ID: {self.public_id}, '\
+               f'private ID: {self.private_id.hex().upper()}, '\
+               f'AES key: {self.aes_key.hex().upper()}, '\
+               f'usage counter: {self.usage_counter}, '\
+               f'power-on: {self._poweron} '\
+               f'[timestamp: {self.timestamp:06X}], '\
+               f'session usage counter: {self.session_counter})'
+
+    def info(self, pre: str = '', lc: bool = False) -> str:
+        """
+        Return string containing parameters of the YubiKey.
+
+        pre: prefix to add before each line
+        lc: use lower case for hex
+        """
+        serial = int.from_bytes(ModHex.dec(self.public_id[4:]))
+
+        private_id = self.private_id.hex()
+        aes_key = self.aes_key.hex()
+        if not lc:
+            private_id = private_id.upper()
+            aes_key = aes_key.upper()
+
+        return f'{pre}Public ID: {self.public_id} (serial: {serial})\n'\
+               f'{pre}Private ID: {private_id}\n'\
+               f'{pre}AES key: {aes_key}\n'\
+               f'{pre}Usage counter: {self.usage_counter} '\
+               f'({self.usage_counter:{"x" if lc else "X"}}h)'
+
+    def create(self, public_id: str, private_id: bytes, aes_key: bytes,
+               usage_counter: int = 0, timestamp: None | int = None,
+               session_counter: int = 0) -> None:
+        # pylint: disable=too-many-arguments
+        """
+        Create a YubiKey with given parameters.
+
+        public_id (12-digit ModHex): public ID
+        private_id (6 bytes): private ID
+        aes_key (16 bytes): AES key
+        usage_counter (16-bit int): nonvolatile usage counter
+        timestamp (24-bit int): volatile timestamp
+        session_counter (8-bit int): volatile session usage counter
+        """
+        if len(public_id) != 12 or not ModHex.valid(public_id):
+            raise ValueError('public_id must be 12 ModHex digits '
+                             f'(got "{public_id}")')
+        self.public_id = public_id
+
+        if len(private_id) != 6:
+            raise ValueError('private_id must be 6 bytes '
+                             f'(got {private_id.hex().upper()})')
+        self.private_id = private_id
+
+        if len(aes_key) != 16:
+            raise ValueError('aes_key must be 16 bytes '
+                             f'(got {aes_key.hex().upper()})')
+        self.aes_key = aes_key
+
+        if usage_counter < 0:
+            raise ValueError('usage_counter must be non-segative '
+                             f'(got {usage_counter})')
+        if usage_counter > 0x7FFF:
+            raise ValueError('usage_counter is too large '
+                             f'({usage_counter} > {0x7FFF})')
+        self.usage_counter = usage_counter
+
+        if timestamp is None:
+            # random with 20 bits (~1.5 days) margin
+            self.timestamp = randbelow(0xF00000)
+        else:
+            self.timestamp = timestamp & 0xFFFFFF
+        self._poweron = datetime.now(timezone.utc)
+
+        if session_counter < 0:
+            raise ValueError('session_counter must be non-negative '
+                             f'(got {session_counter})')
+        if session_counter > 0xFF:
+            raise ValueError('session_counter is too large '
+                             f'({session_counter} > {0xFF})')
+        self.session_counter = session_counter
+
+    def load(self, name: str) -> None:
+        """ Load YubiKey with given name from file. """
+        param = {'public_id': None,
+                 'private_id': None,
+                 'aes_key': None,
+                 'usage_counter': None}
+        try:
+            with open(name + '.yk', 'r', encoding='ascii') as fin:
+                for line in fin.readlines():
+                    p, v = line.rstrip().split(': ')
+                    if p not in param:
+                        raise ValueError(f'Unknown parameter "{p}"')
+                    param[p] = v  # type: ignore
+        except FileNotFoundError as e:
+            raise ValueError(f'Cannot open file "{name}.yk"') from e
+
+        if param['public_id'] is None:
+            raise ValueError('public_id is missing')
+        public_id = param['public_id']
+
+        if param['private_id'] is None:
+            raise ValueError('private_id is missing')
+        try:
+            private_id = bytes.fromhex(param['private_id'])
+        except ValueError as e:
+            raise ValueError('Private ID must be 12 hex digits '
+                             f'(got "{param["private_id"]}")') from e
+
+        if param['aes_key'] is None:
+            raise ValueError('aes_key is missing')
+        try:
+            aes_key = bytes.fromhex(param['aes_key'])
+        except ValueError as e:
+            raise ValueError('AES key must be 32 hex digits '
+                             f'(got "{param["aes_key"]}")') from e
+
+        if param['usage_counter'] is None:
+            raise ValueError('usage_counter is missing')
+        try:
+            usage_counter = int(param['usage_counter'])
+        except ValueError as e:
+            raise ValueError('Usage counter must be an integer '
+                             f'(got "{param["usage_counter"]}")') from e
+
+        self.create(public_id, private_id, aes_key, usage_counter)
+
+    def save(self, name: str) -> None:
+        """ Save YubiKey with given name to file. """
+        fname = name + '.yk'
+
+        try:
+            os.rename(fname, fname + '~')
+            backup = True
+        except FileNotFoundError:
+            backup = False
+
+        os.umask(0o077)
+        with open(fname, 'w', encoding='ascii') as fout:
+            used = 1 if self.session_counter else 0
+            fout.write(f'public_id: {self.public_id}\n'
+                       f'private_id: {self.private_id.hex().upper()}\n'
+                       f'aes_key: {self.aes_key.hex().upper()}\n'
+                       f'usage_counter: {self.usage_counter + used}\n')
+
+        if backup:
+            os.remove(fname + '~')
+
+    @staticmethod
+    def _crc16(data: bytes) -> int:
+        """ Generate the CRC-16 value for a byte string. """
+        crc = 0xFFFF
+        for byte in iter(data):
+            crc ^= byte
+            for _ in range(8):
+                lsb = crc & 1
+                crc >>= 1
+                if lsb == 1:
+                    crc ^= 0x8408
+        return crc
+
+    @classmethod
+    def _verify_crc16(cls, data: bytes) -> bool:
+        """ Check that a byte string has a valid CRC-16 residual. """
+        return cls._crc16(data) == 0xF0B8
+
+    def otp(self, rand: None | int) -> str:
+        """ Generate an OTP. """
+        if self.session_counter > 0xFF:
+            raise OverflowError('Session counter overflow')
+
+        delta = datetime.now(timezone.utc) - self._poweron
+        timestamp = (self.timestamp +
+                     int(delta.total_seconds() * 8)) & 0xFFFFFF
+
+        rand = randbelow(0x10000) if rand is None else rand & 0xFFFF
+
+        buf = pack('<6s H 3s B H',
+                   self.private_id,
+                   self.usage_counter,
+                   timestamp.to_bytes(3, byteorder='little'),
+                   self.session_counter,
+                   rand)
+        token = buf + pack('<H', ~self._crc16(buf) & 0xFFFF)
+
+        self.session_counter += 1
+
+        return self.public_id + ModHex.enc(AES(self.aes_key).enc(token))
+
+    @classmethod
+    def parse(cls, aes_key: bytes, otp: str) -> tuple:
+        """
+        Parse an OTP.
+        Returns:
+            public ID (12-digit ModHex),
+            private ID (6 bytes),
+            usage counter (16-bit int),
+            timestamp (24-bit int),
+            session usage counter (8-bit int),
+            random padding (16-bit int)
+        """
+        public_id = otp[:-32]
+
+        buf = otp[-32:]
+        if not ModHex.valid(buf):
+            raise ValueError(f'"{buf}" is not a valid ModHex string')
+        token = AES(aes_key).dec(ModHex.dec(buf))
+        if not cls._verify_crc16(token):
+            raise CRCError('OTP checksum is invalid')
+
+        private_id, usage_counter, t, session_counter, rand = \
+            unpack('<6s H 3s B H', token[:-2])
+        timestamp = int.from_bytes(t, byteorder='little')
+
+        return (public_id, private_id, usage_counter, timestamp,
+                session_counter, rand)
+
+    @classmethod
+    def parse_print(cls, aes_key: bytes, otp: str, pre: str = '') -> None:
+        """ Parse and print an OTP. """
+        try:
+            (public_id, private_id, usage_counter, timestamp, session_counter,
+                rand) = cls.parse(aes_key, otp)
+        except (ValueError, CRCError) as e:
+            print(e)
+            return
+        print(f'{pre}Public ID: {public_id}\n'
+              f'{pre}Private ID: {private_id.hex().upper()}\n'
+              f'{pre}Usage counter: {usage_counter}\n'
+              f'{pre}Timestamp: {timestamp:06X}\n'
+              f'{pre}Session usage counter: {session_counter}\n'
+              f'{pre}Random padding: {rand:04X}')
+
+
+def action_init(name: str, serial: None | int, public: None | str,
+                private: None | bytes, aes_key: None | bytes,
+                counter: None | int) -> None:
+    # pylint: disable=too-many-arguments
+    """ Create and save a new key. """
+    if os.path.exists(name + '.yk'):
+        print(f'Key "{name}" already exists.')
+        return
+
+    if public is not None:
+        public_id = public
+    else:
+        public_id = 'dddd' + ModHex.enc(token_bytes(4) if serial is None else
+                                        serial.to_bytes(4, byteorder='big'))
+
+    private_id = token_bytes(6) if private is None else private
+
+    if aes_key is None:
+        aes_key = token_bytes(16)
+
+    usage_counter = 0 if counter is None else counter
+
+    key = YubiKey()
+    key.create(public_id, private_id, aes_key, usage_counter)
+    print('New key:')
+    print(key.info(pre='  '))
+    key.save(name)
+    print(f'Saved as "{name}".')
+
+
+def action_info(name: str, lowercase: bool) -> None:
+    """ Print information about the key. """
+    key = YubiKey()
+    key.load(name)
+    print(f'Key "{name}":')
+    print(key.info(pre='  ', lc=lowercase))
+
+
+def action_gen(name: str, interactive: bool, timestamp: None | int,
+               session: None | int, random: None | int) -> None:
+    """ Generate an OTP using the key. """
+    key = YubiKey()
+    key.load(name)
+
+    if timestamp is not None:
+        key.timestamp = timestamp & 0xFFFFFF
+
+    if session is not None:
+        if not 0 <= session <= 0xFF:
+            raise ValueError(f'Wrong session counter {session}')
+        key.session_counter = session
+
+    if interactive:
+        try:
+            while True:
+                print(key.otp(random))
+                input()
+        except KeyboardInterrupt:
+            pass
+    else:
+        print(key.otp(random))
+
+    key.save(name)
+
+
+def action_parse(name: str, otp: str) -> None:
+    """ Parse an OTP generated by a known key (or AES key). """
+    aes_key = None
+    if len(name) == 32:
+        try:
+            aes_key = bytes.fromhex(name)
+        except ValueError:
+            pass
+    if aes_key is None:
+        key = YubiKey()
+        key.load(name)
+        aes_key = key.aes_key
+
+    print(f'Parsing with AES key {aes_key.hex().upper()}:')
+    YubiKey.parse_print(aes_key, otp, pre='  ')
+
+
+parser = argparse.ArgumentParser(
+    prog='yksim',
+    description='YubiKey simulator for OTP generation (and parsing).',
+    epilog='For help on actions, add -h or --help after action name.')
+parser.add_argument(
+    'name', type=str, default='default', nargs='?',
+    help='key name [default]')
+parser.set_defaults(action=lambda **_: parser.print_usage())
+subparsers = parser.add_subparsers(title='actions')
+
+parser_init = subparsers.add_parser(
+    'init', help='create a new key',
+    description='Create and save a new key with given or random parameters.')
+group = parser_init.add_mutually_exclusive_group()
+group.add_argument(
+    '-ser', '--serial', type=int,
+    help='serial number (decimal) [random]')
+group.add_argument(
+    '-pub', '--public', type=str,
+    help='public ID (12 ModHex digits) [random]')
+parser_init.add_argument(
+    '-priv', '--private', type=bytes.fromhex,
+    help='private ID (12 hex digits) [random]')
+parser_init.add_argument(
+    '-k', '--aes_key', type=bytes.fromhex,
+    help='AES key (32 hex digits) [random]')
+parser_init.add_argument(
+    '-c', '--counter', type=int,
+    help=f'usage counter (decimal, 0–{0x7FFF}) [0]')
+parser_init.set_defaults(action=action_init)
+
+parser_info = subparsers.add_parser(
+    'info', help='print information about the key',
+    description='Print information about the key.')
+parser_info.add_argument(
+    '-l', '--lowercase', action='store_true',
+    help='print hex numbers in lower case')
+parser_info.set_defaults(action=action_info)
+
+parser_gen = subparsers.add_parser(
+    'gen', help='use the key to generate OTP(s)',
+    description='Use the key to generate an OTP or '
+                'start an interactive OTP generation session. '
+                'The usage counter in the key file will be updated.',
+    epilog='In the interactive mode, TIMESTAMP and SESSION set the initial '
+           'values, but RANDOM is used for every OTP.')
+parser_gen.add_argument(
+    '-i', '--interactive', action='store_true',
+    help='interactive mode — generate an OTP after every Enter key press '
+         '(exit on Ctrl+C)')
+parser_gen.add_argument(
+    '-t', '--timestamp', type=int,
+    help=f'timestamp (decimal, 0–{0xFFFFFF}) [random]')
+parser_gen.add_argument(
+    '-s', '--session', type=int,
+    help=f'session usage counter (decimal, 0–{0xFF}) [0]')
+parser_gen.add_argument(
+    '-r', '--random', type=lambda s: int.from_bytes(bytes.fromhex(s)),
+    help='random padding (4 hex digits) [random]')
+parser_gen.set_defaults(action=action_gen)
+
+parser_parse = subparsers.add_parser(
+    'parse', help='parse an OTP from the key (or AES key)',
+    description='Parse OTP generated by a known key '
+                '(a hex-encoded AES key can be used instead of name).')
+parser_parse.add_argument(
+    'otp', type=str,
+    help='OTP string')
+parser_parse.set_defaults(action=action_parse)
+
+cmd_args = vars(parser.parse_args())
+action = cmd_args.pop('action')
+try:
+    action(**cmd_args)
+except ValueError as e:
+    print(e)
